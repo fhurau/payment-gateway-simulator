@@ -38,10 +38,12 @@ public class LedgerService {
     @Transactional
     public void processPaymentCreated(EventEnvelope envelope) {
         UUID eventId = UUID.fromString(envelope.eventId());
+        UUID paymentId = UUID.fromString(envelope.paymentId());
 
         try {
-            jdbcTemplate.update("INSERT INTO consumed_events (event_id, event_type) VALUES (?, ?)",
-                    eventId, envelope.eventType());
+            jdbcTemplate.update(
+                    "INSERT INTO consumed_events (event_id, event_type, payment_id) VALUES (?, ?, ?)",
+                    eventId, envelope.eventType(), paymentId);
         } catch (DuplicateKeyException e) {
             // Redelivery of an already-processed event (§10 step 1): skip, do not reprocess.
             // Postgres has already aborted this transaction on the constraint violation, so
@@ -50,7 +52,6 @@ public class LedgerService {
             return;
         }
 
-        UUID paymentId = UUID.fromString(envelope.paymentId());
         Map<String, String> payload = envelope.payload();
         String fromAccount = payload.get("fromAccount");
         String toAccount = payload.get("toAccount");

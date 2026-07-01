@@ -209,10 +209,11 @@ CREATE TABLE outbox (
 **`processor` DB (payment-processor):**
 ```sql
 CREATE TABLE accounts (
-    account_id VARCHAR PRIMARY KEY,
-    balance    NUMERIC(19,4) NOT NULL,
-    currency   VARCHAR(3) NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    account_id      VARCHAR PRIMARY KEY,
+    balance         NUMERIC(19,4) NOT NULL,
+    opening_balance NUMERIC(19,4) NOT NULL, -- immutable seed value; §12 reconciliation compares against this
+    currency        VARCHAR(3) NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE payments (
     id             UUID PRIMARY KEY,
@@ -237,6 +238,7 @@ CREATE TABLE ledger_entries (
 CREATE TABLE consumed_events (
     event_id    UUID PRIMARY KEY,
     event_type  VARCHAR NOT NULL,
+    payment_id  UUID,                        -- populated for payment.created; used by §12 reconciliation
     consumed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- plus an outbox table, same shape as gateway.outbox, for completed/failed events
