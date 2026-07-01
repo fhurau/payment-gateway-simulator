@@ -24,3 +24,6 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew build
+
+      - name: Run E2E + contract test suite (§15)
+        run: ./gradlew :e2e-tests:e2eTest
