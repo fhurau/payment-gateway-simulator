@@ -19,6 +19,9 @@ public class KafkaErrorHandlerConfig {
 
     @Bean
     public DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, String> kafkaTemplate) {
+        // record.partition() is only safe because every topic here auto-creates with 1
+        // partition; if source topics ever gain partitions, .dlq topics must match or this
+        // resolver must map to partition 0.
         var recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
                 (record, ex) -> new org.apache.kafka.common.TopicPartition(
                         record.topic() + ".dlq", record.partition()));

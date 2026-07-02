@@ -1,6 +1,7 @@
 package com.paymentgateway.apigateway.security.ratelimit;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paymentgateway.apigateway.redis.RedisCircuitBreaker;
 import com.paymentgateway.apigateway.web.ErrorResponse;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -27,11 +28,14 @@ public class RateLimitFilter extends GenericFilterBean {
     private final StringRedisTemplate redisTemplate;
     private final RateLimitProperties properties;
     private final ObjectMapper objectMapper;
+    private final RedisCircuitBreaker circuitBreaker;
 
-    public RateLimitFilter(StringRedisTemplate redisTemplate, RateLimitProperties properties, ObjectMapper objectMapper) {
+    public RateLimitFilter(StringRedisTemplate redisTemplate, RateLimitProperties properties,
+            ObjectMapper objectMapper, RedisCircuitBreaker circuitBreaker) {
         this.redisTemplate = redisTemplate;
         this.properties = properties;
         this.objectMapper = objectMapper;
+        this.circuitBreaker = circuitBreaker;
     }
 
     @Override
@@ -48,6 +52,12 @@ public class RateLimitFilter extends GenericFilterBean {
             return;
         }
 
+        if (circuitBreaker.isOpen()) {
+            // Known Redis outage: fail open without paying the client timeout on this thread.
+            chain.doFilter(request, response);
+            return;
+        }
+
         long windowEpoch = System.currentTimeMillis() / 1000 / properties.windowSeconds();
         String key = "ratelimit:" + request.getRemoteAddr() + ":" + windowEpoch;
 
@@ -57,10 +67,12 @@ public class RateLimitFilter extends GenericFilterBean {
             if (count != null && count == 1L) {
                 redisTemplate.expire(key, Duration.ofSeconds(properties.windowSeconds()));
             }
+            circuitBreaker.recordSuccess();
         } catch (Exception e) {
             // Redis down: fail open. The limiter is abuse protection, not the security
             // boundary (JWT is still enforced downstream), and a Redis outage must not
             // take the whole payment path with it (§7's Redis-is-only-a-fast-path stance).
+            circuitBreaker.recordFailure();
             chain.doFilter(request, response);
             return;
         }
