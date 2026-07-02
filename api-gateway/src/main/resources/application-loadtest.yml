@@ -1,0 +1,6 @@
+# Only for load-test/run.sh: the load test measures ledger/idempotency throughput, not the
+# Phase 7 rate limiter (already verified on its own). Activated via SPRING_PROFILES_ACTIVE=loadtest.
+app:
+  rate-limit:
+    limit: 1000000
+    window-seconds: 60

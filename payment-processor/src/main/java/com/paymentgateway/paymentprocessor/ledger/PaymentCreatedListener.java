@@ -1,11 +1,14 @@
 package com.paymentgateway.paymentprocessor.ledger;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.MDC;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
 @Component
 public class PaymentCreatedListener {
+
+    private static final String MDC_KEY = "correlationId";
 
     private final LedgerService ledgerService;
     private final ObjectMapper objectMapper;
@@ -18,6 +21,11 @@ public class PaymentCreatedListener {
     @KafkaListener(topics = "payment.created")
     public void onPaymentCreated(String message) throws Exception {
         EventEnvelope envelope = objectMapper.readValue(message, EventEnvelope.class);
-        ledgerService.processPaymentCreated(envelope);
+        MDC.put(MDC_KEY, envelope.correlationId());
+        try {
+            ledgerService.processPaymentCreated(envelope);
+        } finally {
+            MDC.remove(MDC_KEY);
+        }
     }
 }

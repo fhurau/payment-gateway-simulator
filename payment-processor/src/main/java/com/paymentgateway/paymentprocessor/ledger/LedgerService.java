@@ -52,6 +52,8 @@ public class LedgerService {
             return;
         }
 
+        log.info("processing payment.created for paymentId={}", paymentId);
+
         Map<String, String> payload = envelope.payload();
         String fromAccount = payload.get("fromAccount");
         String toAccount = payload.get("toAccount");
