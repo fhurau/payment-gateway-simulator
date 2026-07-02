@@ -155,6 +155,48 @@ the actual interview-relevant design decision, not the retry loop itself.
 with no `payments` row, any global debit/credit imbalance, or any account balance that doesn't
 match its seed plus net ledger movement. An empty array means the books balance.
 
+### Manual DLQ replay (§11's recovery answer)
+
+A dead-lettered message means retries were exhausted (or the message was poison). To recover one:
+
+**1. Inspect** what's sitting in a DLQ topic (here `payment.created.dlq`; same for
+`payment.completed.dlq` / `payment.failed.dlq`):
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:19092 \
+  --topic payment.created.dlq --from-beginning --timeout-ms 5000
+```
+
+**2. Fix the root cause** (the DB was down, the message was malformed, …). Replaying before
+that just dead-letters the message again.
+
+**3. Replay** the message value back onto its **source** topic (strip the `.dlq` suffix):
+
+```bash
+echo '<the JSON envelope printed in step 1>' | \
+  docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:19092 --topic payment.created
+```
+
+Why this is safe:
+- **Replay is idempotent.** Every consumer dedupes on the envelope's `eventId` via its
+  `consumed_events` table, so replaying a message that (partially) succeeded before is a no-op.
+- **Tracing survives.** The console producer can't attach the `correlationId` Kafka header, but
+  consumers fall back to the `correlationId` inside the envelope body when the header is absent.
+- Topics run with one partition in this demo, so replaying without the original `paymentId`
+  key doesn't reorder anything.
+
+**Parked outbox rows** are the producer-side analogue: a row the relay failed to publish 5
+times is excluded from polling and logged as "parked" (its `failed_attempts` column hit the
+cap). After fixing the cause — usually a broker outage, or a hand-edited row — reset it:
+
+```sql
+UPDATE outbox SET failed_attempts = 0 WHERE id = '<row id from the log line>';
+```
+
+The relay picks it up on the next 500ms poll.
+
 ## Load test: honest local-laptop numbers
 
 Run it yourself: `bash load-test/run.sh` (needs Docker only — it runs [k6](https://k6.io/) in a
