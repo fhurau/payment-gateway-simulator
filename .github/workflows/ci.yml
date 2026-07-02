@@ -38,3 +38,43 @@ jobs:
 
       - name: Run E2E + contract test suite (§15)
         run: ./gradlew :e2e-tests:e2eTest
+
+  kind-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: payment-gateway-demo
+
+      - name: Deploy to kind (§17)
+        run: |
+          chmod +x k8s/deploy.sh
+          k8s/deploy.sh
+
+      - name: Smoke test - demo token + payment through the deployed stack
+        run: |
+          kubectl port-forward svc/api-gateway 8080:8080 &
+          PF_PID=$!
+          trap "kill $PF_PID" EXIT
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:8080/actuator/health && break
+            sleep 2
+          done
+          curl -sf http://localhost:8080/actuator/health | grep -q '"status":"UP"'
+          TOKEN=$(curl -sf -X POST http://localhost:8080/auth/token | sed -E 's/.*"token":"([^"]+)".*/\1/')
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/payments \
+            -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: kind-ci-smoke-test" \
+            -H "Content-Type: application/json" \
+            -d '{"fromAccount":"jpy-funded","toAccount":"jpy-low","amount":"1","currency":"JPY"}')
+          echo "POST /payments through kind returned $STATUS"
+          [ "$STATUS" = "201" ]
+
+      - name: Dump pod status on failure
+        if: failure()
+        run: |
+          kubectl get pods -A
+          kubectl describe pods
+          kubectl logs -l app=api-gateway --tail=200 || true
