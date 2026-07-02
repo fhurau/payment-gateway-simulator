@@ -174,6 +174,8 @@ Two-layer: **Postgres is the source of truth, Redis is the fast path.**
 
 Why Postgres is truth and Redis is only cache: eviction or a restart must never cause a duplicate payment. In doubt, hit Postgres.
 
+**Redis outage behavior:** every request-path Redis call (idempotency fast path, rate limiter §14) fails open to its fallback (Postgres / no limit), and a shared circuit breaker opens after 3 consecutive failures so that during a known outage requests skip Redis entirely instead of each paying the client timeout on a servlet thread. Consequence to state honestly: while Redis is down, rate limiting is off — correctness (idempotency) is never compromised, only throttling.
+
 ---
 
 ## 8. Transactional Outbox (removes the dual-write)
@@ -182,7 +184,7 @@ Publishing to Kafka and writing the DB are **not** one atomic action. Both `api-
 
 1. Business transaction writes its rows **and** an `outbox` row (event, headers, payload) in the **same DB transaction**. All-or-nothing.
 2. A relay (`@Scheduled` poller, small fixed delay) reads unpublished `outbox` rows in order, publishes to Kafka, marks `published_at`. At-least-once by design; duplicates absorbed by consumer de-dupe (§10).
-3. **Per-row failure isolation:** each row publishes inside its own try/catch. A row that fails has `failed_attempts` incremented and the loop continues — one poison row must never head-of-line-block the rows behind it (`SKIP LOCKED` only helps across *instances*, and each service runs one). After 5 failed attempts the row is **parked** (excluded from the poll) and logged for manual recovery — the producer-side analogue of the consumer DLQ; the README documents the reset.
+3. **Per-row failure isolation, classified:** only **row-intrinsic** failures (the record can't be built from the row's data, or the broker rejects that specific record, e.g. too large) count toward the parking threshold; after 5 such attempts the row is **parked** (excluded from the poll), logged, and counted in the `outbox_parked_rows` gauge — the producer-side analogue of the consumer DLQ; the README documents the reset. **Systemic** failures (broker unreachable, send timeout) never count: the batch stops early and the next poll retries, so a Kafka outage backs off indefinitely instead of parking the backlog. Sends are time-bounded (10s) so an outage can't hold the batch transaction and its row locks for the producer's default multi-minute delivery timeout. One poison row must never head-of-line-block the rows behind it (`SKIP LOCKED` only helps across *instances*, and each service runs one).
 
 Guarantees an event is emitted **iff** its transaction committed — no lost events, no phantom events. (CDC/Debezium is a valid alternative; the poller is chosen for zero-cost simplicity — note this trade-off in the README.)
 
@@ -255,7 +257,7 @@ CREATE TABLE consumed_events (
 -- plus an outbox table, same shape as gateway.outbox, for completed/failed events
 ```
 
-**`notification` DB:** `consumed_events` (same shape) for de-dupe, plus `notifications` (`id, payment_id, event_id, channel, status, sent_at`).
+**`notification` DB:** `consumed_events` (`event_id, event_type, consumed_at` — like processor's but without `payment_id`, which only §12 reconciliation needs) for de-dupe, plus `notifications` (`id, payment_id, event_id, channel, status, sent_at`).
 
 Seed accounts via a Flyway seed migration: at least two **JPY** accounts (one well-funded, one near-empty to demo insufficient funds) and one USD account. The demo must work with zero manual setup.
 
@@ -267,7 +269,7 @@ On `payment.created`, in **one transaction**:
 
 1. Insert `consumed_events(eventId)` first — if it already exists (PK conflict), this is a redelivery: **skip and commit** (consumer idempotency).
 2. `SELECT ... FOR UPDATE` the `from` account (pessimistic lock).
-3. Validate: account exists, currency matches both accounts, `balance >= amount`.
+3. Validate: amount is sane (sign/magnitude/scale re-checked per §4's defense-in-depth, `INVALID_AMOUNT_SCALE`), account exists, not a self-transfer (`SELF_TRANSFER`, §4), currency matches both accounts, `balance >= amount`.
    - **Business failure** (missing account, currency mismatch, insufficient funds): set payment `FAILED` + `failure_reason`, write an `outbox` row for `payment.failed`, **commit**. Normal outcome — do **not** throw, do **not** DLQ.
    - **Success:** write two `ledger_entries` (DEBIT from, CREDIT to), update both `accounts.balance`, set payment `COMPLETED`, write an `outbox` row for `payment.completed`.
 4. Commit. Debit + credit + balance updates + status + consumed-event + outbox all succeed together or roll back together — a failed transaction reverts to a state consistent with "never happened."
@@ -318,7 +320,7 @@ Empty list = healthy. The concrete "how would you detect a stuck or lost payment
 
 - Thin **JWT** auth (Spring Security) on `POST /payments`; `/auth/token` dev endpoint mints a demo token; Swagger Authorize pre-fill. Cuttable via a `demo` profile.
 - Bean Validation (`@NotNull`, `@Positive` `BigDecimal`, `@Pattern` for ISO-4217, custom scale-by-currency validator) on every request DTO.
-- Rate limiting at `api-gateway` via the Redis-counter pattern proven in distributed-auth-platform Day 3 (reuse the approach, not the code).
+- Rate limiting at `api-gateway` via the Redis-counter pattern proven in distributed-auth-platform Day 3 (reuse the approach, not the code). **Known limitations, stated rather than hidden:** (1) the counter is keyed on the direct client IP with no `X-Forwarded-For` handling — correct for the primary docker-compose path (direct connection), but under the kind/K8s demo (§17) kube-proxy SNATs the source address, so all clients share one bucket; per-client fairness there would need trusted-proxy header handling that a demo deploy doesn't justify. (2) Only `POST /payments` is limited; `POST /auth/token` is unauthenticated *and* unlimited, so the **rate limiter — not the JWT — is the real abuse boundary**: anyone can mint a demo token at line rate, by design (§1's frictionless-demo contract). Both are acceptable for a simulator and would be the first two things to change for real exposure.
 - Gitleaks + Trivy in CI from Phase 7.
 - Actuator + Micrometer Prometheus registry on all 3 services; **Grafana** with a pre-provisioned payments dashboard (throughput, success/fail rate, p99 latency, DLQ depth).
 - `correlationId` generated at `api-gateway`, carried in the Kafka header (§4), read into MDC by each consumer — one payment's logs traceable across all 3 services by one ID.

@@ -7,6 +7,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paymentgateway.apigateway.redis.RedisCircuitBreaker;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -21,7 +22,9 @@ class RateLimitFilterTest {
     private final StringRedisTemplate redisTemplate = mock(StringRedisTemplate.class);
     private final ValueOperations<String, String> valueOperations = mock(ValueOperations.class);
     private final RateLimitProperties properties = new RateLimitProperties(2, 60);
-    private final RateLimitFilter filter = new RateLimitFilter(redisTemplate, properties, new ObjectMapper());
+    private final RedisCircuitBreaker circuitBreaker = new RedisCircuitBreaker();
+    private final RateLimitFilter filter =
+            new RateLimitFilter(redisTemplate, properties, new ObjectMapper(), circuitBreaker);
 
     private HttpServletRequest request(String servletPath) {
         HttpServletRequest request = mock(HttpServletRequest.class);
@@ -63,6 +66,22 @@ class RateLimitFilterTest {
         verify(response).setStatus(429);
         verify(chain, never()).doFilter(request, response);
         assertThat(body.toString()).contains("RATE_LIMIT_EXCEEDED");
+    }
+
+    @Test
+    void openCircuitBreakerSkipsRedisEntirelyAndFailsOpen() throws Exception {
+        for (int i = 0; i < 3; i++) {
+            circuitBreaker.recordFailure(); // trip the breaker
+        }
+
+        HttpServletRequest request = request("/payments");
+        HttpServletResponse response = mock(HttpServletResponse.class);
+        FilterChain chain = mock(FilterChain.class);
+
+        filter.doFilter(request, response, chain);
+
+        verify(chain).doFilter(request, response);
+        verify(redisTemplate, never()).opsForValue(); // no Redis call, no timeout paid
     }
 
     @Test
