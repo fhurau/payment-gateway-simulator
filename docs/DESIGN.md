@@ -118,7 +118,9 @@ This table exists because these get mixed up constantly. It is load-bearing.
 | `payment.created` | `paymentId` | api-gateway → payment-processor |
 | `payment.completed` | `paymentId` | payment-processor → notification-service |
 | `payment.failed` | `paymentId` | payment-processor → notification-service |
-| `payment.created.dlq` | `paymentId` | dead-letter target after retries are exhausted (infra errors only) |
+| `payment.created.dlq` | `paymentId` | dead-letter target for `payment-processor`'s consumer, after retries are exhausted (infra errors only) |
+| `payment.completed.dlq` | `paymentId` | dead-letter target for `notification-service`'s consumer, same classification rule |
+| `payment.failed.dlq` | `paymentId` | dead-letter target for `notification-service`'s consumer, same classification rule |
 
 Keyed by `paymentId` so all events for one payment land on the same partition — per-payment ordering without global ordering.
 
@@ -270,7 +272,7 @@ On `payment.created`, in **one transaction**:
 
 ## 11. Retry & Dead-Letter Strategy
 
-Spring Kafka `DefaultErrorHandler` + `ExponentialBackOff` (start 1s, x2, max 3 attempts) + `DeadLetterPublishingRecoverer` → `payment.created.dlq`. Don't hand-roll retry.
+Spring Kafka `DefaultErrorHandler` + `ExponentialBackOff` (start 1s, x2, max 3 attempts) + `DeadLetterPublishingRecoverer` → `<source-topic>.dlq`. Applied identically on every consumer in the system — `payment-processor`'s `payment.created` listener and `notification-service`'s `payment.completed`/`payment.failed` listener both use this exact bean shape, each routing to its own source topic's `.dlq`. Don't hand-roll retry.
 
 **Classification is the point** — only *infra* errors reach this handler:
 - **Retryable** (transient infra: deadlock, connection loss) → backoff retries → DLQ if exhausted.
