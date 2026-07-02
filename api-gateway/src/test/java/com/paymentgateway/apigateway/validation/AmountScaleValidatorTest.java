@@ -52,6 +52,35 @@ class AmountScaleValidatorTest {
     }
 
     @Test
+    void scientificNotationIsRejected() {
+        // "1e100" has a negative BigDecimal scale, so it passes a scale-only check while
+        // overflowing NUMERIC(19,4) at insert time - the historical gateway bypass.
+        var request = new PaymentRequest("acc-1", "acc-2", "1e100", "JPY");
+        Set<ConstraintViolation<PaymentRequest>> violations = validator.validate(request);
+        assertThat(violations).anyMatch(v -> v.getMessage().contains("plain decimal notation"));
+    }
+
+    @Test
+    void plainIntegerBeyondFifteenDigitsIsRejected() {
+        var request = new PaymentRequest("acc-1", "acc-2", "10000000000000000", "JPY"); // 17 digits
+        Set<ConstraintViolation<PaymentRequest>> violations = validator.validate(request);
+        assertThat(violations).anyMatch(v -> v.getMessage().contains("15 integer digits"));
+    }
+
+    @Test
+    void fifteenIntegerDigitsIsStillValid() {
+        var request = new PaymentRequest("acc-1", "acc-2", "999999999999999", "JPY");
+        assertThat(validator.validate(request)).isEmpty();
+    }
+
+    @Test
+    void selfTransferIsRejected() {
+        var request = new PaymentRequest("acc-1", "acc-1", "1000", "JPY");
+        Set<ConstraintViolation<PaymentRequest>> violations = validator.validate(request);
+        assertThat(violations).anyMatch(v -> v.getMessage().startsWith("SELF_TRANSFER_NOT_ALLOWED"));
+    }
+
+    @Test
     void unknownCurrencyIsRejectedByIsoCurrencyConstraint() {
         var request = new PaymentRequest("acc-1", "acc-2", "10", "XXX_NOT_REAL");
         assertThat(validator.validate(request)).isNotEmpty();

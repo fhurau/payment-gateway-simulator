@@ -38,18 +38,19 @@ public class IdempotencyStore {
     }
 
     public Optional<StoredRecord> findInRedis(String idempotencyKey) {
-        String raw = redisTemplate.opsForValue().get(redisKey(idempotencyKey));
-        if (raw == null) {
-            return Optional.empty();
-        }
         try {
+            String raw = redisTemplate.opsForValue().get(redisKey(idempotencyKey));
+            if (raw == null) {
+                return Optional.empty();
+            }
             JsonNode envelope = objectMapper.readTree(raw);
             return Optional.of(new StoredRecord(
                     envelope.get("requestHash").asText(),
                     envelope.get("status").asInt(),
                     objectMapper.writeValueAsString(envelope.get("body"))));
         } catch (Exception e) {
-            return Optional.empty(); // corrupt/unexpected cache entry - fall through to Postgres
+            // Redis down or a corrupt cache entry - either way, §7: in doubt, hit Postgres.
+            return Optional.empty();
         }
     }
 

@@ -40,7 +40,10 @@ public class RateLimitFilter extends GenericFilterBean {
         HttpServletRequest request = (HttpServletRequest) servletRequest;
         HttpServletResponse response = (HttpServletResponse) servletResponse;
 
-        if (!"/payments".equals(request.getRequestURI())) {
+        // getServletPath is container-decoded and path-parameter-stripped - the same view of
+        // the path Spring MVC routes on. Matching the raw getRequestURI let "/payments;x=y"
+        // and "/%70ayments" bypass the limiter while still reaching the controller.
+        if (!"/payments".equals(request.getServletPath())) {
             chain.doFilter(request, response);
             return;
         }
@@ -48,9 +51,18 @@ public class RateLimitFilter extends GenericFilterBean {
         long windowEpoch = System.currentTimeMillis() / 1000 / properties.windowSeconds();
         String key = "ratelimit:" + request.getRemoteAddr() + ":" + windowEpoch;
 
-        Long count = redisTemplate.opsForValue().increment(key);
-        if (count != null && count == 1L) {
-            redisTemplate.expire(key, Duration.ofSeconds(properties.windowSeconds()));
+        Long count;
+        try {
+            count = redisTemplate.opsForValue().increment(key);
+            if (count != null && count == 1L) {
+                redisTemplate.expire(key, Duration.ofSeconds(properties.windowSeconds()));
+            }
+        } catch (Exception e) {
+            // Redis down: fail open. The limiter is abuse protection, not the security
+            // boundary (JWT is still enforced downstream), and a Redis outage must not
+            // take the whole payment path with it (§7's Redis-is-only-a-fast-path stance).
+            chain.doFilter(request, response);
+            return;
         }
 
         if (count != null && count > properties.limit()) {

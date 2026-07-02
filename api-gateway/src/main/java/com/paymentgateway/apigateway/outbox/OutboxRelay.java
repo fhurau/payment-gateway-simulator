@@ -7,6 +7,8 @@ import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -15,15 +17,24 @@ import org.springframework.transaction.annotation.Transactional;
 
 /**
  * Publishes unpublished {@code outbox} rows to Kafka (§8). Runs its own transaction per batch,
- * holding row locks via {@code FOR UPDATE SKIP LOCKED} so a slow send never blocks other rows and
- * concurrent relay instances never double-claim the same row. At-least-once by design: if the
- * process dies between a successful send and marking {@code published_at}, the row is re-sent on
- * the next poll - duplicates are absorbed by consumer de-dupe (§10 step 1).
+ * holding row locks via {@code FOR UPDATE SKIP LOCKED} so concurrent relay instances never
+ * double-claim the same row (within this single instance, rows are processed sequentially).
+ * Each row is published inside its own try/catch: a row that fails to publish has its
+ * {@code failed_attempts} incremented and the loop moves on, so one poison row never
+ * head-of-line-blocks the rows behind it. After {@link #MAX_ATTEMPTS} failures the row is
+ * parked - excluded from the poll - for manual recovery (see the README's DLQ/outbox
+ * recovery section). At-least-once by design: if the process dies between a successful send
+ * and marking {@code published_at}, the row is re-sent on the next poll - duplicates are
+ * absorbed by consumer de-dupe (§10 step 1).
  */
 @Component
 public class OutboxRelay {
 
-    private record OutboxRow(UUID id, UUID aggregateId, UUID eventId, String eventType,
+    static final int MAX_ATTEMPTS = 5;
+
+    private static final Logger log = LoggerFactory.getLogger(OutboxRelay.class);
+
+    record OutboxRow(UUID id, UUID aggregateId, UUID eventId, String eventType,
             String headersJson, String payloadJson, OffsetDateTime createdAt) {
     }
 
@@ -44,7 +55,8 @@ public class OutboxRelay {
         List<OutboxRow> rows = jdbcTemplate.query(
                 "SELECT id, aggregate_id, event_id, event_type, headers::text AS headers, "
                         + "payload::text AS payload, created_at "
-                        + "FROM outbox WHERE published_at IS NULL ORDER BY created_at LIMIT 50 FOR UPDATE SKIP LOCKED",
+                        + "FROM outbox WHERE published_at IS NULL AND failed_attempts < " + MAX_ATTEMPTS
+                        + " ORDER BY created_at LIMIT 50 FOR UPDATE SKIP LOCKED",
                 (rs, rowNum) -> new OutboxRow(
                         UUID.fromString(rs.getString("id")),
                         UUID.fromString(rs.getString("aggregate_id")),
@@ -55,8 +67,26 @@ public class OutboxRelay {
                         rs.getObject("created_at", OffsetDateTime.class)));
 
         for (OutboxRow row : rows) {
-            publish(row);
+            try {
+                publish(row);
+            } catch (Exception e) {
+                recordFailure(row, e);
+                continue;
+            }
             jdbcTemplate.update("UPDATE outbox SET published_at = now() WHERE id = ?", row.id());
+        }
+    }
+
+    private void recordFailure(OutboxRow row, Exception e) {
+        Integer attempts = jdbcTemplate.queryForObject(
+                "UPDATE outbox SET failed_attempts = failed_attempts + 1 WHERE id = ? RETURNING failed_attempts",
+                Integer.class, row.id());
+        if (attempts != null && attempts >= MAX_ATTEMPTS) {
+            log.error("outbox row {} ({}) parked after {} failed publish attempts - "
+                    + "see README's outbox recovery section", row.id(), row.eventType(), attempts, e);
+        } else {
+            log.warn("failed to publish outbox row {} ({}), attempt {}/{}",
+                    row.id(), row.eventType(), attempts, MAX_ATTEMPTS, e);
         }
     }
 

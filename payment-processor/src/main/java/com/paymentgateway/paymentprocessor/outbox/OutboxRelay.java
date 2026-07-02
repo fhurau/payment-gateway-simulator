@@ -7,6 +7,8 @@ import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.UUID;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -15,12 +17,17 @@ import org.springframework.transaction.annotation.Transactional;
 
 /**
  * Publishes unpublished {@code outbox} rows ({@code payment.completed}/{@code payment.failed})
- * to Kafka (§8). Same pattern as api-gateway's relay - see that class for the rationale.
+ * to Kafka (§8). Same pattern as api-gateway's relay - see that class for the rationale,
+ * including the per-row failure isolation and {@code failed_attempts} parking.
  */
 @Component
 public class OutboxRelay {
 
-    private record OutboxRow(UUID id, UUID aggregateId, UUID eventId, String eventType,
+    static final int MAX_ATTEMPTS = 5;
+
+    private static final Logger log = LoggerFactory.getLogger(OutboxRelay.class);
+
+    record OutboxRow(UUID id, UUID aggregateId, UUID eventId, String eventType,
             String headersJson, String payloadJson, OffsetDateTime createdAt) {
     }
 
@@ -41,7 +48,8 @@ public class OutboxRelay {
         List<OutboxRow> rows = jdbcTemplate.query(
                 "SELECT id, aggregate_id, event_id, event_type, headers::text AS headers, "
                         + "payload::text AS payload, created_at "
-                        + "FROM outbox WHERE published_at IS NULL ORDER BY created_at LIMIT 50 FOR UPDATE SKIP LOCKED",
+                        + "FROM outbox WHERE published_at IS NULL AND failed_attempts < " + MAX_ATTEMPTS
+                        + " ORDER BY created_at LIMIT 50 FOR UPDATE SKIP LOCKED",
                 (rs, rowNum) -> new OutboxRow(
                         UUID.fromString(rs.getString("id")),
                         UUID.fromString(rs.getString("aggregate_id")),
@@ -52,8 +60,26 @@ public class OutboxRelay {
                         rs.getObject("created_at", OffsetDateTime.class)));
 
         for (OutboxRow row : rows) {
-            publish(row);
+            try {
+                publish(row);
+            } catch (Exception e) {
+                recordFailure(row, e);
+                continue;
+            }
             jdbcTemplate.update("UPDATE outbox SET published_at = now() WHERE id = ?", row.id());
+        }
+    }
+
+    private void recordFailure(OutboxRow row, Exception e) {
+        Integer attempts = jdbcTemplate.queryForObject(
+                "UPDATE outbox SET failed_attempts = failed_attempts + 1 WHERE id = ? RETURNING failed_attempts",
+                Integer.class, row.id());
+        if (attempts != null && attempts >= MAX_ATTEMPTS) {
+            log.error("outbox row {} ({}) parked after {} failed publish attempts - "
+                    + "see README's outbox recovery section", row.id(), row.eventType(), attempts, e);
+        } else {
+            log.warn("failed to publish outbox row {} ({}), attempt {}/{}",
+                    row.id(), row.eventType(), attempts, MAX_ATTEMPTS, e);
         }
     }
 

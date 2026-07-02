@@ -2,6 +2,7 @@ package com.paymentgateway.paymentprocessor.ledger;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.BigDecimal;
+import java.util.Currency;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -106,8 +107,14 @@ public class LedgerService {
     }
 
     private String validate(AccountRow from, AccountRow to, String currency, BigDecimal amount) {
+        if (amountInvalid(amount, currency)) {
+            return "INVALID_AMOUNT_SCALE";
+        }
         if (from == null || to == null) {
             return "ACCOUNT_NOT_FOUND";
+        }
+        if (from.accountId().equals(to.accountId())) {
+            return "SELF_TRANSFER";
         }
         if (!from.currency().equals(currency) || !to.currency().equals(currency)) {
             return "CURRENCY_MISMATCH";
@@ -116,6 +123,23 @@ public class LedgerService {
             return "INSUFFICIENT_FUNDS";
         }
         return null;
+    }
+
+    /**
+     * Defense-in-depth mirror of api-gateway's AmountScaleValidator (§4). The gateway already
+     * 400s these, but an event injected straight onto the topic must fail as a committed
+     * business outcome (§11) - not overflow NUMERIC(19,4) mid-transaction and take the
+     * retry/DLQ path, which would leave the payment stuck PENDING and invisible to §12.
+     */
+    private boolean amountInvalid(BigDecimal amount, String currency) {
+        if (amount.signum() <= 0 || amount.precision() - amount.scale() > 15) {
+            return true;
+        }
+        try {
+            return amount.stripTrailingZeros().scale() > Currency.getInstance(currency).getDefaultFractionDigits();
+        } catch (IllegalArgumentException e) {
+            return false; // unknown currency code: CURRENCY_MISMATCH against the accounts reports it
+        }
     }
 
     private void insertPayment(UUID paymentId, String status, String fromAccount, String toAccount,

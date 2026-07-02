@@ -23,9 +23,9 @@ class RateLimitFilterTest {
     private final RateLimitProperties properties = new RateLimitProperties(2, 60);
     private final RateLimitFilter filter = new RateLimitFilter(redisTemplate, properties, new ObjectMapper());
 
-    private HttpServletRequest request(String uri) {
+    private HttpServletRequest request(String servletPath) {
         HttpServletRequest request = mock(HttpServletRequest.class);
-        when(request.getRequestURI()).thenReturn(uri);
+        when(request.getServletPath()).thenReturn(servletPath);
         when(request.getRemoteAddr()).thenReturn("127.0.0.1");
         return request;
     }
@@ -63,6 +63,22 @@ class RateLimitFilterTest {
         verify(response).setStatus(429);
         verify(chain, never()).doFilter(request, response);
         assertThat(body.toString()).contains("RATE_LIMIT_EXCEEDED");
+    }
+
+    @Test
+    void redisOutageFailsOpenInsteadOf500() throws Exception {
+        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        when(valueOperations.increment(org.mockito.ArgumentMatchers.anyString()))
+                .thenThrow(new org.springframework.data.redis.RedisConnectionFailureException("redis down"));
+
+        HttpServletRequest request = request("/payments");
+        HttpServletResponse response = mock(HttpServletResponse.class);
+        FilterChain chain = mock(FilterChain.class);
+
+        filter.doFilter(request, response, chain);
+
+        verify(chain).doFilter(request, response);
+        verify(response, never()).setStatus(429);
     }
 
     @Test
