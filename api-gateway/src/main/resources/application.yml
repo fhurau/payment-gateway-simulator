@@ -14,6 +14,10 @@ spring:
     redis:
       host: localhost
       port: 6379
+      # Bounded so a Redis outage degrades to the Postgres path (§7) in ~2s per lookup
+      # instead of Lettuce's 60s default command timeout stalling every POST /payments.
+      connect-timeout: 2s
+      timeout: 2s
   kafka:
     bootstrap-servers: localhost:9092
     producer:
