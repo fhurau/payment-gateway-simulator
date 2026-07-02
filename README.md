@@ -187,9 +187,12 @@ Why this is safe:
 - Topics run with one partition in this demo, so replaying without the original `paymentId`
   key doesn't reorder anything.
 
-**Parked outbox rows** are the producer-side analogue: a row the relay failed to publish 5
-times is excluded from polling and logged as "parked" (its `failed_attempts` column hit the
-cap). After fixing the cause — usually a broker outage, or a hand-edited row — reset it:
+**Parked outbox rows** are the producer-side analogue: a row whose *own data* made publishing
+fail 5 times (unbuildable record, or one the broker rejects as too large) is excluded from
+polling and logged as "parked" (its `failed_attempts` column hit the cap; current count is on
+the `outbox_parked_rows` gauge). A broker outage never parks rows — the relay classifies
+connectivity failures as systemic, backs off, and retries each poll until Kafka returns. After
+fixing a parked row's actual cause, reset it:
 
 ```sql
 UPDATE outbox SET failed_attempts = 0 WHERE id = '<row id from the log line>';
@@ -222,6 +225,13 @@ correctness property (idempotency) under real concurrency, not just raw req/s.
 `POST /payments` requires a JWT (`POST /auth/token` mints a demo one — dev-only, pre-fillable via
 Swagger's Authorize button). `api-gateway` also rate-limits `/payments` via a Redis fixed-window
 counter (`429` past the configured threshold). Gitleaks and Trivy scan every CI run.
+
+Two honest caveats, by design for a zero-friction demo: `/auth/token` is unauthenticated and not
+rate-limited, so the **rate limiter is the actual abuse boundary**, not the JWT; and if Redis is
+down, a circuit breaker fails the limiter open (requests flow unthrottled, idempotency falls back
+to Postgres — correctness holds, throttling pauses). The limiter is also keyed on the direct
+client IP, which is right for docker-compose but means the kind/K8s demo's SNAT'd traffic shares
+one bucket. DESIGN.md §14 spells all three out.
 
 ## Observability
 

@@ -3,6 +3,7 @@ package com.paymentgateway.apigateway.payment;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.paymentgateway.apigateway.redis.RedisCircuitBreaker;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.UUID;
@@ -27,30 +28,43 @@ public class IdempotencyStore {
     private final StringRedisTemplate redisTemplate;
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
+    private final RedisCircuitBreaker circuitBreaker;
 
-    public IdempotencyStore(StringRedisTemplate redisTemplate, JdbcTemplate jdbcTemplate, ObjectMapper objectMapper) {
+    public IdempotencyStore(StringRedisTemplate redisTemplate, JdbcTemplate jdbcTemplate,
+            ObjectMapper objectMapper, RedisCircuitBreaker circuitBreaker) {
         this.redisTemplate = redisTemplate;
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
+        this.circuitBreaker = circuitBreaker;
     }
 
     public record StoredRecord(String requestHash, int status, String body) {
     }
 
     public Optional<StoredRecord> findInRedis(String idempotencyKey) {
+        if (circuitBreaker.isOpen()) {
+            return Optional.empty(); // known outage - go straight to Postgres, don't pay the timeout
+        }
+        String raw;
         try {
-            String raw = redisTemplate.opsForValue().get(redisKey(idempotencyKey));
-            if (raw == null) {
-                return Optional.empty();
-            }
+            raw = redisTemplate.opsForValue().get(redisKey(idempotencyKey));
+            circuitBreaker.recordSuccess();
+        } catch (Exception e) {
+            // Redis down - §7: in doubt, hit Postgres.
+            circuitBreaker.recordFailure();
+            return Optional.empty();
+        }
+        if (raw == null) {
+            return Optional.empty();
+        }
+        try {
             JsonNode envelope = objectMapper.readTree(raw);
             return Optional.of(new StoredRecord(
                     envelope.get("requestHash").asText(),
                     envelope.get("status").asInt(),
                     objectMapper.writeValueAsString(envelope.get("body"))));
         } catch (Exception e) {
-            // Redis down or a corrupt cache entry - either way, §7: in doubt, hit Postgres.
-            return Optional.empty();
+            return Optional.empty(); // corrupt cache entry - fall through to Postgres
         }
     }
 
@@ -90,6 +104,9 @@ public class IdempotencyStore {
     }
 
     public void cacheInRedis(String idempotencyKey, String requestHash, int status, String body) {
+        if (circuitBreaker.isOpen()) {
+            return; // best-effort cache write - skip during a known outage
+        }
         try {
             JsonNode bodyNode = objectMapper.readTree(body);
             ObjectNode envelope = objectMapper.createObjectNode();
@@ -97,8 +114,10 @@ public class IdempotencyStore {
             envelope.put("status", status);
             envelope.set("body", bodyNode);
             redisTemplate.opsForValue().set(redisKey(idempotencyKey), objectMapper.writeValueAsString(envelope), REDIS_TTL);
+            circuitBreaker.recordSuccess();
         } catch (Exception e) {
             // Redis is a best-effort fast path; Postgres remains the source of truth.
+            circuitBreaker.recordFailure();
         }
     }
 
