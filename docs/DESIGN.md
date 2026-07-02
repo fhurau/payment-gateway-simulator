@@ -142,10 +142,13 @@ Body:   { "fromAccount": "string", "toAccount": "string",
 409  same Idempotency-Key reused with a DIFFERENT request body (request-hash mismatch)
 429  rate limit exceeded
 
-GET /payments/{paymentId}  → { paymentId, status: PENDING|COMPLETED|FAILED, failureReason? }
-                             (proxied to payment-processor)
-GET /reconciliation        → list of mismatches, empty if healthy (proxied to payment-processor)
 ```
+
+**Not implemented in `api-gateway`** (unbuilt "read-only admin views," §17 — a deliberate scope
+cut, not an oversight): a `GET /payments/{paymentId}` status proxy and a `GET /reconciliation`
+proxy. `payment-processor` exposes `GET :8081/reconciliation` directly (§12) — that's what
+`./demo.sh` and any manual check use today. Payment status can be read from the `processor` DB's
+`payments` table until a proxy endpoint exists.
 
 Every service exposes **Swagger UI** at `/swagger-ui` with the demo JWT pre-fillable via the Authorize button. Auth is a thin layer — if time-constrained, ship a permissive `demo` profile and note it in the README.
 
