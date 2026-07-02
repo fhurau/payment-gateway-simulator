@@ -101,12 +101,14 @@ This table exists because these get mixed up constantly. It is load-bearing.
 
 // payment.failed
 { "fromAccount": "string", "toAccount": "string", "amount": "1000", "currency": "JPY",
-  "failureReason": "INSUFFICIENT_FUNDS | ACCOUNT_NOT_FOUND | CURRENCY_MISMATCH | INVALID_AMOUNT_SCALE" }
+  "failureReason": "INSUFFICIENT_FUNDS | ACCOUNT_NOT_FOUND | CURRENCY_MISMATCH | INVALID_AMOUNT_SCALE | SELF_TRANSFER" }
 ```
 
 **Money rules (fintech-critical, JP-specific):**
 - `amount` is always a **string** in JSON, never a JSON number — no float precision loss.
 - Validate the amount's decimal **scale against the currency's ISO-4217 minor-unit exponent**: **JPY = 0 decimals** (¥1000, never ¥1000.00), USD = 2, KWD = 3. An amount with more fractional digits than the currency allows → `400 INVALID_AMOUNT_SCALE`. Store as `NUMERIC(19,4)` (a safe superset), but **validate and format** by exponent.
+- Validate the amount's **magnitude and notation** at the gateway: plain decimal form only (no scientific notation — `"1e100"` has a negative `BigDecimal` scale and slips past a scale-only check) and at most **15 integer digits** (the `NUMERIC(19,4)` ceiling). Violations → `400`. `payment-processor` re-checks sign, magnitude, and scale as defense-in-depth: an event injected straight onto the topic fails as a committed **business** outcome (`payment.failed` with `INVALID_AMOUNT_SCALE`, §10/§11), never as a `NUMERIC` overflow taking the retry/DLQ path.
+- **Self-transfers are rejected**: `fromAccount == toAccount` → `400 SELF_TRANSFER_NOT_ALLOWED` at the gateway; `payment-processor` re-checks and fails such an injected event with `failureReason: SELF_TRANSFER`. A self-transfer would net to zero while still writing two ledger entries against one account — allowed nowhere.
 - Getting JPY right is the detail a Japanese fintech reviewer notices first — treat it as a core requirement, not a nicety.
 
 ---
@@ -139,7 +141,7 @@ Body:   { "fromAccount": "string", "toAccount": "string",
 
 201  { "paymentId": "uuid", "status": "PENDING", "idempotencyKey": "uuid" }
 200  duplicate key, same request body → the original stored response, no reprocessing
-400  validation error (incl. amount scale invalid for currency, §4)
+400  validation error (incl. amount scale/magnitude/notation invalid, or fromAccount == toAccount, §4)
 401  missing/invalid JWT
 409  same Idempotency-Key reused with a DIFFERENT request body (request-hash mismatch)
 429  rate limit exceeded
@@ -180,6 +182,7 @@ Publishing to Kafka and writing the DB are **not** one atomic action. Both `api-
 
 1. Business transaction writes its rows **and** an `outbox` row (event, headers, payload) in the **same DB transaction**. All-or-nothing.
 2. A relay (`@Scheduled` poller, small fixed delay) reads unpublished `outbox` rows in order, publishes to Kafka, marks `published_at`. At-least-once by design; duplicates absorbed by consumer de-dupe (§10).
+3. **Per-row failure isolation:** each row publishes inside its own try/catch. A row that fails has `failed_attempts` incremented and the loop continues — one poison row must never head-of-line-block the rows behind it (`SKIP LOCKED` only helps across *instances*, and each service runs one). After 5 failed attempts the row is **parked** (excluded from the poll) and logged for manual recovery — the producer-side analogue of the consumer DLQ; the README documents the reset.
 
 Guarantees an event is emitted **iff** its transaction committed — no lost events, no phantom events. (CDC/Debezium is a valid alternative; the poller is chosen for zero-cost simplicity — note this trade-off in the README.)
 
@@ -200,14 +203,15 @@ CREATE TABLE idempotency_keys (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE outbox (
-    id           UUID PRIMARY KEY,
-    aggregate_id UUID NOT NULL,          -- paymentId
-    event_id     UUID NOT NULL UNIQUE,
-    event_type   VARCHAR NOT NULL,
-    headers      JSONB NOT NULL,         -- includes correlationId
-    payload      JSONB NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    published_at TIMESTAMPTZ             -- NULL until relayed
+    id              UUID PRIMARY KEY,
+    aggregate_id    UUID NOT NULL,          -- paymentId
+    event_id        UUID NOT NULL UNIQUE,
+    event_type      VARCHAR NOT NULL,
+    headers         JSONB NOT NULL,         -- includes correlationId
+    payload         JSONB NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at    TIMESTAMPTZ,            -- NULL until relayed
+    failed_attempts INT NOT NULL DEFAULT 0  -- §8: row parked once this hits the relay's cap
 );
 ```
 
@@ -225,7 +229,9 @@ CREATE TABLE payments (
     status         VARCHAR NOT NULL CHECK (status IN ('PENDING','COMPLETED','FAILED')),
     from_account   VARCHAR NOT NULL,
     to_account     VARCHAR NOT NULL,
-    amount         NUMERIC(19,4) NOT NULL,
+    amount         NUMERIC NOT NULL,  -- unbounded: records what was *requested*, incl. amounts
+                                      -- FAILED as INVALID_AMOUNT_SCALE for exceeding NUMERIC(19,4);
+                                      -- money that moves (ledger_entries, accounts) stays NUMERIC(19,4)
     currency       VARCHAR(3) NOT NULL,
     failure_reason VARCHAR,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -279,7 +285,7 @@ Spring Kafka `DefaultErrorHandler` + `ExponentialBackOff` (start 1s, x2, max 3 a
 - **Not retryable** (deserialization / poison message) → `addNotRetryableExceptions(...)` → straight to DLQ.
 - **Business outcomes** (insufficient funds, etc.) never throw — they produce `payment.failed` and commit (§10). Never retry or DLQ them.
 
-Document a manual DLQ replay path so "how do you recover a dead-lettered payment" has an answer.
+The manual DLQ replay path — inspect the DLQ topic, fix the root cause, pipe the envelope back onto the source topic (safe because consumers dedupe on `eventId`, and the body carries a `correlationId` fallback for the header the console producer can't set) — is documented in the README's "Manual DLQ replay" section, alongside the reset procedure for parked outbox rows (§8).
 
 ---
 
