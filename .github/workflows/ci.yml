@@ -15,7 +15,7 @@ jobs:
         run: docker run --rm -v ${{ github.workspace }}:/repo zricethezav/gitleaks:latest detect --source=/repo --no-git -v --redact
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
