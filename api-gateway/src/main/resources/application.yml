@@ -37,3 +37,13 @@ management:
 springdoc:
   swagger-ui:
     path: /swagger-ui
+
+app:
+  security:
+    jwt:
+      # ponytail: demo-only static secret, plug-and-play per DESIGN §1; override JWT_SECRET for any non-demo use
+      secret: ${JWT_SECRET:demo-only-insecure-jwt-signing-key-do-not-use-in-prod-9f3a7c}
+      expiry-minutes: 15
+  rate-limit:
+    limit: 20
+    window-seconds: 60
