@@ -38,7 +38,7 @@ Claude Code must not swap build tool, JDK, or broker mid-project. **AWS and Kube
 **Plug-and-play contract (hard requirement — a recruiter must succeed in ~60 seconds):**
 1. `git clone` → `docker compose up` brings up all 3 services + Postgres + Kafka + Redis + Grafana. Nothing else. No cloud account, no paid API key, no manual DB setup.
 2. Flyway **seeds demo accounts** (JPY + USD) on startup so payments work immediately.
-3. `GET /auth/token` (dev) returns a **demo JWT**, pre-wired into Swagger's Authorize button and the README curl.
+3. `POST /auth/token` (dev) returns a **demo JWT**, pre-wired into Swagger's Authorize button and the README curl.
 4. **Swagger UI** is reachable per service; a recruiter can click "Try it out" and watch a payment flow end to end.
 5. A **`./demo.sh`** script fires a happy payment, a duplicate-idempotency-key payment, and an insufficient-funds payment, and prints the results + reconciliation status.
 6. A **Grafana** dashboard shows live payment metrics. It is nice-to-have: if a recruiter skips it, everything else still works.
