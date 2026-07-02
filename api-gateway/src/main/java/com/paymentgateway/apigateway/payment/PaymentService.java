@@ -2,13 +2,19 @@ package com.paymentgateway.apigateway.payment;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paymentgateway.apigateway.payment.IdempotencyStore.StoredRecord;
+import com.paymentgateway.apigateway.web.CorrelationIdFilter;
 import java.util.Map;
 import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 
 @Service
 public class PaymentService {
+
+    private static final Logger log = LoggerFactory.getLogger(PaymentService.class);
 
     private final IdempotencyStore idempotencyStore;
     private final ObjectMapper objectMapper;
@@ -41,8 +47,12 @@ public class PaymentService {
         PaymentResponse responseBody = new PaymentResponse(paymentId.toString(), "PENDING", idempotencyKey);
 
         try {
+            String correlationId = MDC.get(CorrelationIdFilter.MDC_KEY);
+            if (correlationId == null) {
+                correlationId = UUID.randomUUID().toString();
+            }
             String responseBodyJson = objectMapper.writeValueAsString(responseBody);
-            String headersJson = objectMapper.writeValueAsString(Map.of("correlationId", UUID.randomUUID().toString()));
+            String headersJson = objectMapper.writeValueAsString(Map.of("correlationId", correlationId));
             String payloadJson = objectMapper.writeValueAsString(Map.of(
                     "fromAccount", request.fromAccount(),
                     "toAccount", request.toAccount(),
@@ -53,6 +63,7 @@ public class PaymentService {
                     UUID.randomUUID(), UUID.randomUUID(), headersJson, payloadJson);
 
             idempotencyStore.cacheInRedis(idempotencyKey, requestHash, 201, responseBodyJson);
+            log.info("payment initiated paymentId={} idempotencyKey={}", paymentId, idempotencyKey);
             return new PaymentOutcome(201, responseBody);
         } catch (DuplicateKeyException e) {
             // Lost the race for this key (§7): the winner has already committed, re-read its row.
